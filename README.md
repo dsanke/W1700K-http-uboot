@@ -1,6 +1,24 @@
-# XR1710G U-Boot (Fork with DHCP Fix & CI Build)
+# W1700K U-Boot (AN7581 HTTP Recovery)
 
-> **Fork by** [naoki66](https://github.com/naoki66) · **Original project** by [YYH2913](https://github.com/YYH2913/http-uboot) · **Original release** [260712](https://github.com/YYH2913/http-uboot/releases/tag/260712)
+> **Based on** [naoki66](https://github.com/naoki66/XR1710G-http-uboot) / [YYH2913](https://github.com/YYH2913/http-uboot)
+
+## W1700K support
+
+The same AN7581 platform family also includes the Gemtek W1700K (CenturyLink /
+Lumen / Quantum Fiber). This repository builds HTTP-recovery U-Boot for both
+boards from the same tree:
+
+- `make an7581_w1700k_defconfig` — Gemtek W1700K (default)
+- `make xr1710g_defconfig` — Brightspeed XR1710G
+
+The W1700K build shares the recovery stack (lwIP HTTP server, RTL8261 10G
+training, chainloader packaging) and only swaps the board device tree, default
+environment and the recovery LAN LED GPIO mapping. CI (`build.yml`) accepts a
+`board` input (`xr1710g` or `w1700k`) and names the artifacts
+`<board>-uboot-<date>-g<commit>-flash-slot.bin` / `-chainloader.itb`.
+
+Companion firmware: [ImmortalWrt-for-Gemtek-XR1710G](https://github.com/naoki66/ImmortalWrt-for-Gemtek-XR1710G)
+(currently configured to build the `gemtek_w1700k-ubi` image).
 
 ## 捐赠 / Donate
 
@@ -59,25 +77,32 @@ Use this after the custom U-Boot is installed and you only want to update the
 main OpenWrt firmware.
 
 1. Connect the PC to the 10GbE port and leave the PC NIC in DHCP mode.
-2. Power on the router.
-3. Once the 10GbE port LED starts blinking, press and hold the `reset` button.
-4. If you are unsure about the timing, wait a few more seconds. Because of the
-   chainloader, there is a fairly large timing margin here.
-5. Release the button after the status LED changes from solid red to the
+2. Press and hold the `reset` button, wait a few seconds for the button to
+   settle, and only then apply power (keep holding). This is the reliable way
+   to enter recovery - pressing the button at the exact moment of power-on is
+   timing-sensitive and may leave the vendor first-stage bootloader waiting
+   with all LEDs off.
+3. Release the button after the status LED changes from solid red to the
    flowing recovery pattern.
-6. Open `http://192.168.255.1`.
-7. Select the upload target:
+4. Open `http://192.168.255.1`.
+5. Select the upload target:
    - `firmware` writes the OpenWrt-generated `*-sysupgrade.itb` to `ubi:fit`.
    - `uboot` writes `xr1710g-chainloader-slot.bin` to the raw chainloader slot.
-8. For a firmware upload, select the layout encoded in that image's embedded
+6. For a firmware upload, select the layout encoded in that image's embedded
    device tree: `UBI 2.0`, `UBI 1.5`, or `UBI 1.0`. The selector controls the
    erase/rebuild boundary; it does not convert or patch the uploaded image.
-9. Full rebuild recreates `ubootenv`, `ubootenv2`, `fit`, and `rootfs_data`.
+7. Full rebuild recreates `ubootenv`, `ubootenv2`, `fit`, and `rootfs_data`.
    Factory EEPROM and MAC data are restored from the vendor DSD region, while
    saved U-Boot environment values are reset.
-10. Do not select a layout based only on the currently detected flash layout.
+8. Do not select a layout based only on the currently detected flash layout.
     The selection must match the new image. A mismatch can let U-Boot load the
     kernel but leave Linux waiting indefinitely for `/dev/fit0`.
+
+
+> Alternative timing: power on normally first, wait until the 10GbE port LED
+> starts blinking (the chainloader has handed off to this U-Boot), then press
+> and hold `reset`. This also works; the key is not to press the button at the
+> instant of power-on.
 
 Current HTTP Recovery page with the image-layout selector:
 

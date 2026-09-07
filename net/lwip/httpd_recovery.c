@@ -39,7 +39,7 @@
 #include <lwip/prot/dhcp.h>
 #include <lwip/prot/iana.h>
 #include <version.h>
-#include <xr1710g_version.h>
+#include <an7581_recovery_version.h>
 #include <timestamp.h>
 #include <limits.h>
 #include <miiphy.h>
@@ -280,8 +280,24 @@ struct recovery_dhcp_server {
 };
 
 static const int recovery_led_phy_addrs[RECOVERY_LED_PORTS] = { 9, 10 };
-static const u8 recovery_green_led_gpios[RECOVERY_LED_PORTS] = { 43, 44 };
-static const u8 recovery_yellow_led_gpios[RECOVERY_LED_PORTS] = { 33, 34 };
+/* Per-board LAN LEDs. Defaults are the XR1710G LAN1/LAN2 lines. */
+static u8 recovery_green_led_gpios[RECOVERY_LED_PORTS] = { 43, 44 };
+static u8 recovery_yellow_led_gpios[RECOVERY_LED_PORTS] = { 33, 34 };
+
+static void recovery_led_gpios_init(void)
+{
+	/*
+	 * W1700K exposes its two switch-port LEDs on GPIO 9/10 (lan3) and
+	 * 27/28 (lan4) instead of the XR1710G lan1/lan2 lines (43/44, 33/34).
+	 */
+	if (of_machine_is_compatible("gemtek,w1700k") ||
+	    of_machine_is_compatible("gemtek,w1700k-ubi")) {
+		recovery_green_led_gpios[0] = 9;
+		recovery_green_led_gpios[1] = 27;
+		recovery_yellow_led_gpios[0] = 10;
+		recovery_yellow_led_gpios[1] = 28;
+	}
+}
 
 static void recovery_led_ctrl_free(struct recovery_led_ctrl *ctrl)
 {
@@ -1223,6 +1239,7 @@ static int recovery_led_init(struct recovery_led_ctrl *ctrl)
 	ofnode mdio_node;
 	int i, ret;
 
+	recovery_led_gpios_init();
 	memset(ctrl, 0, sizeof(*ctrl));
 
 	/* Make sure PHY LED mux is disabled so software can own the lines. */
@@ -1749,7 +1766,7 @@ static int recovery_validate_uboot_slot_image(const void *image, size_t size)
 	    fit_magic != RECOVERY_FDT_MAGIC) {
 		printf("Invalid U-Boot slot image: magic[0]=0x%08x magic[0x%04x]=0x%08x\n",
 		       prefix_magic, RECOVERY_UBOOT_SLOT_FIT_OFFSET, fit_magic);
-		printf("Expected xr1710g-chainloader-slot.bin, not u-boot.bin or bare .itb\n");
+		printf("Expected <board>-chainloader-slot.bin, not u-boot.bin or bare .itb\n");
 		return -EINVAL;
 	}
 
@@ -2683,13 +2700,13 @@ int fs_open_custom(struct fs_file *file, const char *name)
 	            snprintf(json, sizeof(json),
 	                     "{\"u_boot\":\"%s (%s - %s %s)\",\"recovery_version\":\"%s\",\"credit\":\"%s\",\"detected_layout\":\"%s\"}\n",
 	                     U_BOOT_VERSION, U_BOOT_DATE, U_BOOT_TIME, U_BOOT_TZ,
-	                     XR1710G_RELEASE_VERSION, XR1710G_RELEASE_CREDIT,
+	                     AN7581_RELEASE_VERSION, AN7581_RELEASE_CREDIT,
 	                     xr1710g_detect_ubi_version());
 #else
 	            snprintf(json, sizeof(json),
 	                     "{\"u_boot\":\"%s\",\"recovery_version\":\"%s\",\"credit\":\"%s\",\"detected_layout\":\"%s\"}\n",
-	                     U_BOOT_VERSION, XR1710G_RELEASE_VERSION,
-	                     XR1710G_RELEASE_CREDIT,
+	                     U_BOOT_VERSION, AN7581_RELEASE_VERSION,
+	                     AN7581_RELEASE_CREDIT,
 	                     xr1710g_detect_ubi_version());
 #endif
         if (json_len < 0)

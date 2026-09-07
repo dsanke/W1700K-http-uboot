@@ -14,7 +14,7 @@
 #include <mtd.h>
 #include <net-common.h>
 #include <ubi_uboot.h>
-#include <xr1710g_version.h>
+#include <an7581_recovery_version.h>
 #include <linux/bitops.h>
 #include <linux/err.h>
 #include <linux/kconfig.h>
@@ -77,7 +77,9 @@ static bool xr1710g_is_compatible(void)
 	return of_machine_is_compatible("econet,xr1710g") ||
 	       of_machine_is_compatible("econet,xr1710g-ubi") ||
 	       of_machine_is_compatible("gemtek,xr1710g") ||
-	       of_machine_is_compatible("gemtek,xr1710g-ubi");
+	       of_machine_is_compatible("gemtek,xr1710g-ubi") ||
+	       of_machine_is_compatible("gemtek,w1700k") ||
+	       of_machine_is_compatible("gemtek,w1700k-ubi");
 }
 
 static void xr1710g_clrsetbits_le32(uintptr_t addr, u32 clear, u32 set)
@@ -656,19 +658,18 @@ int board_late_init(void)
 	const char *ubi_part;
 	const char *recovery_trigger;
 	ulong recovery_addr;
+	bool recovery_pending = false;
 
 	if (xr1710g_is_compatible())
-		printf("XR1710G release %s - %s\n",
-		       XR1710G_RELEASE_VERSION, XR1710G_RELEASE_CREDIT);
+		printf("AN7581 recovery release %s - %s\n",
+		       AN7581_RELEASE_VERSION, AN7581_RELEASE_CREDIT);
 
-	xr1710g_sync_runtime_ethaddrs();
-	ubi_part = xr1710g_detect_ubi_part();
-	snprintf(boot_ubi, sizeof(boot_ubi),
-		 "ubi part %s && run boot_production", ubi_part);
-	env_set("boot_ubi", boot_ubi);
-	if (xr1710g_ubi_layout_available)
-		xr1710g_sync_factory_part(ubi_part);
-
+	/*
+	 * Sample the software recovery trigger and the physical reset button
+	 * before any slow UBI/NAND work. On SPI-NAND the UBI attach and the
+	 * factory sync below can take several seconds; a reset button press
+	 * would already be released by the time it is sampled otherwise.
+	 */
 	recovery_trigger = env_get("recovery_trigger");
 	if (recovery_trigger && recovery_trigger[0]) {
 		/*
@@ -682,10 +683,32 @@ int board_late_init(void)
 		if (env_save())
 			printf("Warning: failed to save environment, recovery "
 			       "will be re-entered on the next boot\n");
-	} else if (!xr1710g_recovery_button_pressed()) {
-		return 0;
-	} else {
+		recovery_pending = true;
+	} else if (xr1710g_recovery_button_pressed()) {
 		printf("Recovery button detected, starting web recovery...\n");
+		recovery_pending = true;
+	}
+
+	/*
+	 * Restore the runtime MACs (fast vendor-MTD read) for both the normal
+	 * boot and the recovery path so the recovery server uses the real MAC.
+	 */
+	xr1710g_sync_runtime_ethaddrs();
+
+	if (!recovery_pending) {
+		/*
+		 * Normal boot: pick the active UBI layout, wire boot_ubi and
+		 * make sure the factory volume (EEPROM + MACs) is populated
+		 * before Linux starts.
+		 */
+		ubi_part = xr1710g_detect_ubi_part();
+		snprintf(boot_ubi, sizeof(boot_ubi),
+			 "ubi part %s && run boot_production", ubi_part);
+		env_set("boot_ubi", boot_ubi);
+		if (xr1710g_ubi_layout_available)
+			xr1710g_sync_factory_part(ubi_part);
+
+		return 0;
 	}
 
 	env_set("ipaddr", "192.168.255.1");

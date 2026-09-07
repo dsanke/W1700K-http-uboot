@@ -1843,14 +1843,14 @@ static int airoha_env_override_bool(const char *name, bool *value)
 
 static bool airoha_gdm4_use_cdm2(struct airoha_eth *eth)
 {
-	bool use_cdm2 = false;
+	bool use_cdm2 = true;
 
 	(void)eth;
 
 	/*
-	 * Keep recovery on the CDM1/QDMA0 datapath by default. The optional
-	 * CDM2/QDMA1 path is experimental and must be enabled explicitly with
-	 * gdm4_cdm2; enabling GDM4 loopback alone must not select QDMA1.
+	 * The external GDM4 port belongs on the Linux-style CDM2/QDMA1 path.
+	 * Keep CDM1/QDMA0 available for the internal 1G recovery ports, while
+	 * gdm4_cdm2 remains an override for diagnosing unusual board layouts.
 	 */
 	airoha_env_override_bool("gdm4_cdm2", &use_cdm2);
 
@@ -1995,10 +1995,10 @@ static void airoha_gdm4_update_cpu_path(struct airoha_eth *eth)
 	}
 
 	/*
-	 * Keep GDM4 on the same FE topology as the Linux driver and GDM2:
-	 * ingress goes through PPE1, then PPE default-cport steers it to the
-	 * active CDM/QDMA path. Direct GDM4->CDM1 can leave packets counted by
-	 * GDM4 MIBs but not delivered to QDMA after repeated recovery restarts.
+	 * Recovery runs a reduced FE setup. Sending external GDM4 RX through
+	 * PPE1 in that state turns frames into invalid 2048-byte descriptors on
+	 * W1700K. Keep the known-good recovery topology and feed the selected
+	 * CDM/QDMA directly; the 1G switch ports remain on CDM1/QDMA0.
 	 */
 	airoha_fe_rmw(eth, REG_PPE_DFT_CPORT(0, FE_PSE_PORT_GDM2),
 		      DFT_CPORT_MASK(FE_PSE_PORT_GDM2),
@@ -2008,8 +2008,7 @@ static void airoha_gdm4_update_cpu_path(struct airoha_eth *eth)
 		      DFT_CPORT_MASK(FE_PSE_PORT_GDM2),
 		      FIELD_PREP(DFT_CPORT_MASK(FE_PSE_PORT_GDM2),
 				 FE_PSE_PORT_CDM1));
-	airoha_set_gdm_port_fwd_cfg(eth, REG_GDM_FWD_CFG(4),
-				    FE_PSE_PORT_PPE1);
+	airoha_set_gdm_port_fwd_cfg(eth, REG_GDM_FWD_CFG(4), sp_cport);
 	airoha_fe_rmw(eth, REG_PPE_DFT_CPORT(0, FE_PSE_PORT_GDM4),
 		      DFT_CPORT_MASK(FE_PSE_PORT_GDM4),
 		      FIELD_PREP(DFT_CPORT_MASK(FE_PSE_PORT_GDM4), sp_cport));

@@ -63,3 +63,9 @@
 	airoha,phy-poll-start = <8>;
 	airoha,phy-poll-end = <12>;
 };
+
+/* The recovery 10G/2.5G path needs the full AN7581 PCS bring-up (including the
+ * pre-E2 manual RX calibration), which lives in the dedicated PCS driver. */
+&eth_pcs {
+	status = "okay";
+};

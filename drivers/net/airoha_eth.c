@@ -33,6 +33,7 @@
 #include <linux/time.h>
 #include <vsprintf.h>
 #include <asm/arch/scu-regmap.h>
+#include "airoha/pcs-airoha.h"
 
 #ifndef MDIO_USXGMII_LINK
 #define MDIO_USXGMII_LINK BIT(15)
@@ -261,6 +262,20 @@
 #define AIROHA_RECOVERY_FDB_MOVE_FLUSH_MS 500
 #define AIROHA_RECOVERY_LINK_POLL_MS 1000
 #define AIROHA_RECOVERY_LINK_RETRY_MS 3000
+/*
+ * GDM4/USXGMII training budget. The link state is polled cheaply; the
+ * destructive bring-up (PHYA init + AN restart) is only re-run after this
+ * timeout, and only a bounded number of times. Re-running the bring-up every
+ * poll aborted the on-going AN instead of speeding it up.
+ */
+#define AIROHA_GDM4_TRAIN_TIMEOUT_MS 10000
+#define AIROHA_GDM4_MAX_RETRAIN 6
+
+/* EN7581 chip SCU: product id tells us whether manual RX calibration is needed
+ * (pre-E2 silicon), matching the Linux pcs-an7581 driver. */
+#define AIROHA_EN7581_SCU_BASE		0x1fa20000
+#define AIROHA_EN7581_SCU_PDIDR		0x5c
+#define AIROHA_EN7581_SCU_PRODUCT_ID	GENMASK(15, 0)
 #define AIROHA_RECOVERY_PHY_POWER_SETTLE_MS 10
 #define AIROHA_RECOVERY_MDIO_RETRIES 3
 #define AIROHA_RECOVERY_MDIO_RETRY_US 1000
@@ -683,6 +698,12 @@ struct airoha_eth {
 	bool gdm4_pcs_ready;
 	bool gdm4_link_up;
 	bool gdm4_copper_link_up;
+	/* "configured & training started" is not the same as "link verified" */
+	bool gdm4_configured;
+	u8 gdm4_retrain_count;
+	/* EN7581 chip revision: pre-E2 silicon needs manual PCS RX calibration */
+	u16 soc_product_id;
+	bool manual_rx_calib;
 	bool recovery_link_poll_started;
 	u8 recovery_lan_wake_pending;
 	bool rtl8261_phy5_wake_pending;
@@ -691,6 +712,7 @@ struct airoha_eth {
 	ulong recovery_last_link_poll_ms;
 	ulong recovery_last_wake_retry_ms;
 	ulong gdm4_last_retry_ms;
+	ulong gdm4_configured_ms;
 	u8 rtl8261_init_mask;
 	bool rtl8261_phy5_pnswap_tx;
 	bool rtl8261_phy5_pnswap_rx;
@@ -945,7 +967,7 @@ static int airoha_rtl8261_serdes_autoneg_set(struct airoha_eth *eth,
 					     int phy_addr, bool enable);
 static int airoha_rtl8261_serdes_mode_update(struct airoha_eth *eth,
 					     int phy_addr);
-static void airoha_eth_gdm4_apply_runtime_phy_cfg(struct airoha_eth *eth);
+static int airoha_eth_gdm4_apply_runtime_phy_cfg(struct airoha_eth *eth);
 static void airoha_gdm4_ensure_ready(struct airoha_eth *eth);
 
 static void airoha_clrsetbits_le32(uintptr_t addr, u32 clear, u32 set)
@@ -1108,11 +1130,90 @@ static void airoha_eth_pcs_post_config(struct airoha_eth *eth)
 		   0);
 }
 
+static bool airoha_eth_use_full_pcs_bringup(struct airoha_eth *eth)
+{
+	const char *env = env_get("recovery_pcs_calib");
+
+	if (env && (!strcmp(env, "0") || !strcmp(env, "off") ||
+		    !strcmp(env, "disable")))
+		return false;
+	if (env && (!strcmp(env, "1") || !strcmp(env, "on") ||
+		    !strcmp(env, "enable")))
+		return true;
+
+	/*
+	 * Default: the reduced inline bring-up is proven on E2+ silicon; the
+	 * manual RX calibration in the PCS driver is required before E2.
+	 */
+	return eth->manual_rx_calib;
+}
+
+static struct udevice *airoha_eth_pcs_device(void)
+{
+	ofnode node = ofnode_by_compatible(ofnode_null(),
+					   "airoha,an7581-pcs-eth");
+	struct udevice *dev;
+
+	if (!ofnode_valid(node))
+		return NULL;
+
+	if (uclass_get_device_by_ofnode(UCLASS_MISC, node, &dev))
+		return NULL;
+
+	return dev;
+}
+
 static void airoha_eth_gdm4_link_up_config(struct airoha_eth *eth)
 {
 	if (!eth->eth_pcs_xfi_mac || !eth->eth_pcs_usxgmii ||
 	    !eth->eth_pcs_hsgmii_rate_adp)
 		return;
+
+	/*
+	 * Pre-E2 silicon needs the manual PCS RX calibration (IDAC search) plus
+	 * the FreqDet FBCK-lock retry loop. That logic only exists in the
+	 * dedicated AN7581 PCS driver, so use its full bring-up there and keep
+	 * the reduced inline sequence (known good on E2+) everywhere else.
+	 * recovery_pcs_calib=0/1 forces one path for A/B testing.
+	 */
+	if (airoha_eth_use_full_pcs_bringup(eth)) {
+		struct udevice *pcs = airoha_eth_pcs_device();
+		int rc = -ENODEV;
+
+		/*
+		 * Mirror the Linux/phylink call order: the PCS driver needs the
+		 * pre/post hooks around the bring-up, otherwise the XFI PCS is
+		 * left half configured (TX never comes up while RX still works).
+		 */
+		if (pcs) {
+			airoha_pcs_pre_config(pcs, PHY_INTERFACE_MODE_USXGMII);
+			rc = airoha_pcs_config(pcs, true,
+					       PHY_INTERFACE_MODE_USXGMII,
+					       NULL, false);
+			if (!rc)
+				rc = airoha_pcs_post_config(pcs,
+							    PHY_INTERFACE_MODE_USXGMII);
+		}
+
+		if (!rc) {
+			if (env_get("recovery_debug"))
+				printf("airoha: GDM4 bring-up via PCS driver (RX calibration included)\n");
+			airoha_eth_gdm4_sync_rtl8261(eth);
+			airoha_eth_gdm4_restart_an(eth);
+			/* Same tail as the inline sequence: release the GIB stall
+			 * bits so the MAC actually passes frames in both
+			 * directions. */
+			airoha_rmw(eth->eth_pcs_xfi_mac, PCS_XFI_GIB_CFG,
+				   PCS_XFI_RXMPI_STOP | PCS_XFI_RXMBI_STOP |
+					   PCS_XFI_TXMPI_STOP |
+					   PCS_XFI_TXMBI_STOP,
+				   0);
+			return;
+		}
+
+		printf("airoha: PCS driver bring-up unavailable (%d), using inline sequence\n",
+		       rc);
+	}
 
 	/*
 	 * Match the upstream Airoha PCS speed-change fix for USXGMII/10GBASE-R:
@@ -3198,26 +3299,32 @@ static void airoha_eth_gdm4_sync_rtl8261(struct airoha_eth *eth)
 	airoha_eth_gdm4_select_speed_mode(eth);
 }
 
-static void airoha_eth_gdm4_apply_runtime_phy_cfg(struct airoha_eth *eth)
+static int airoha_eth_gdm4_apply_runtime_phy_cfg(struct airoha_eth *eth)
 {
 	int ret;
 
 	if (!eth->mdio_dev ||
 	    !airoha_rtl8261_is_initialized(eth, RTL8261_PHY5_ADDR))
-		return;
+		return -ENODEV;
 
 	ret = airoha_rtl8261_apply_board_cfg(eth, RTL8261_PHY5_ADDR);
-	if (ret)
+	if (ret) {
 		printf("rtl8261: phy%d runtime board cfg failed: %d\n",
 		       RTL8261_PHY5_ADDR, ret);
+		return ret;
+	}
 
 	if (!airoha_rtl8261_host_update_enabled())
-		return;
+		return 0;
 
 	ret = airoha_rtl8261_serdes_mode_update(eth, RTL8261_PHY5_ADDR);
-	if (ret)
+	if (ret) {
 		printf("rtl8261: phy%d runtime serdes update failed: %d\n",
 		       RTL8261_PHY5_ADDR, ret);
+		return ret;
+	}
+
+	return 0;
 }
 
 static void airoha_qdma_dump_rx_window(const char *tag, int qdma_id,
@@ -3725,10 +3832,28 @@ static int airoha_rtl8261_apply_board_cfg(struct airoha_eth *eth, int phy_addr)
 			(old_cfg_c22 &
 			 ~(RTL8261_SERDES_HSO_INV | RTL8261_SERDES_HSI_INV)) |
 				serdes_cfg);
-		if (!ret)
-			new_cfg = airoha_mdio_c45_read(eth, phy_addr,
-						       RTL8261_MMD_VEND1,
-						       RTL8261_SERDES_GLOBAL_CFG);
+		if (ret)
+			return ret;
+
+		new_cfg = airoha_mdio_c45_read(eth, phy_addr, RTL8261_MMD_VEND1,
+					       RTL8261_SERDES_GLOBAL_CFG);
+		if (new_cfg < 0)
+			return new_cfg;
+	}
+
+	/*
+	 * Only report success when the configuration is actually visible in
+	 * the PHY: a failed fallback write, a failed read-back, or a register
+	 * that still does not carry the requested bits must propagate as an
+	 * error, otherwise the caller marks the PHY usable while the board
+	 * configuration (TX/RX polarity swap) is not applied.
+	 */
+	if ((new_cfg & (RTL8261_SERDES_HSO_INV | RTL8261_SERDES_HSI_INV)) !=
+	    serdes_cfg) {
+		printf("rtl8261: phy%d board cfg mismatch reg=0x%04x want=0x%08x got=0x%08x (c22=0x%08x)\n",
+		       phy_addr, RTL8261_SERDES_GLOBAL_CFG, serdes_cfg, new_cfg,
+		       old_cfg_c22);
+		return -EIO;
 	}
 
 	return 0;
@@ -4230,21 +4355,89 @@ static bool airoha_recovery_gdm4_candidate(struct airoha_eth *eth)
 static void airoha_gdm4_ensure_ready(struct airoha_eth *eth)
 {
 	ulong now = get_timer(0);
+	bool copper_up = false;
+	u16 copper_speed = 0;
 
-	if (eth->gdm4_link_up && airoha_usxgmii_link_up(eth) &&
+	/*
+	 * The host PCS/AN status bits can read as "up" with no peer attached
+	 * (the PHY keeps signal-detect and a latched AN state). A link is only
+	 * considered verified when the PHY reports a copper link *and* the
+	 * bring-up has actually completed, otherwise the calibration never
+	 * runs and the port looks ready while nothing can pass traffic.
+	 */
+	/* The copper link state itself is owned by the recovery link poll;
+	 * here it only gates the "link verified" decision. */
+	airoha_rtl8261_copper_get(eth, RTL8261_PHY5_ADDR, &copper_up,
+				  &copper_speed);
+
+	if (eth->gdm4_configured && copper_up &&
+	    airoha_usxgmii_link_up(eth) &&
 	    airoha_eth_gdm4_have_rx_signal(eth)) {
+		if (!eth->gdm4_link_up && env_get("recovery_debug"))
+			printf("rtl8261: gdm4 link verified %lums after bring-up\n",
+			       now - eth->gdm4_configured_ms);
+		eth->gdm4_link_up = true;
+		eth->gdm4_retrain_count = 0;
 		eth->gdm4_last_retry_ms = 0;
 		return;
 	}
 
-	if (eth->gdm4_last_retry_ms &&
-	    now - eth->gdm4_last_retry_ms < AIROHA_RECOVERY_LINK_RETRY_MS)
+	/* Having programmed the PHY/PCS is not the same as having a link. */
+	eth->gdm4_link_up = false;
+
+	if (!eth->gdm4_configured) {
+		/* Pace the initial attempts; a failing board config used to be
+		 * re-run on every poll, which restarts the host AN each time. */
+		if (eth->gdm4_last_retry_ms &&
+		    now - eth->gdm4_last_retry_ms < AIROHA_RECOVERY_LINK_RETRY_MS)
+			return;
+
+		if (eth->gdm4_retrain_count >= AIROHA_GDM4_MAX_RETRAIN) {
+			eth->gdm4_last_retry_ms = now;
+			return;
+		}
+
+		eth->gdm4_last_retry_ms = now;
+		if (airoha_eth_gdm4_apply_runtime_phy_cfg(eth))
+			goto count_failure;
+
+		airoha_eth_gdm4_link_up_config(eth);
+		eth->gdm4_configured = true;
+		eth->gdm4_configured_ms = now;
+		if (env_get("recovery_debug"))
+			printf("rtl8261: gdm4 bring-up started\n");
+		return;
+	}
+
+	/*
+	 * Training in progress: poll cheaply and leave the host AN alone.
+	 * Re-running the destructive bring-up on every poll restarts the AN
+	 * and prevents it from ever completing, so only do it after a real
+	 * timeout and only a bounded number of times.
+	 */
+	if (now - eth->gdm4_configured_ms < AIROHA_GDM4_TRAIN_TIMEOUT_MS)
 		return;
 
-	eth->gdm4_last_retry_ms = now;
-	airoha_eth_gdm4_apply_runtime_phy_cfg(eth);
+	if (eth->gdm4_retrain_count >= AIROHA_GDM4_MAX_RETRAIN)
+		return;
+
+	eth->gdm4_retrain_count++;
+	if (env_get("recovery_debug"))
+		printf("rtl8261: gdm4 retrain #%u (no link after %ums)\n",
+		       eth->gdm4_retrain_count, AIROHA_GDM4_TRAIN_TIMEOUT_MS);
+	if (airoha_eth_gdm4_apply_runtime_phy_cfg(eth))
+		goto count_failure;
 	airoha_eth_gdm4_link_up_config(eth);
-	eth->gdm4_link_up = true;
+	eth->gdm4_configured_ms = now;
+	eth->gdm4_last_retry_ms = now;
+	return;
+
+count_failure:
+	eth->gdm4_retrain_count++;
+	if (eth->gdm4_retrain_count >= AIROHA_GDM4_MAX_RETRAIN &&
+	    env_get("recovery_debug"))
+		printf("rtl8261: gdm4 bring-up gave up after %u attempts\n",
+		       eth->gdm4_retrain_count);
 }
 
 static void airoha_gdm4_recovery_prime(struct airoha_eth *eth)
@@ -4440,6 +4633,13 @@ void airoha_recovery_restart_links(struct udevice *dev)
 	if (cycle_10g) {
 		phy5_cycle = true;
 		eth->rtl8261_phy5_wake_pending = true;
+		/*
+		 * Dropping the PHY and re-running the bring-up means the
+		 * "configured" state has to be re-established from scratch.
+		 */
+		eth->gdm4_configured = false;
+		eth->gdm4_retrain_count = 0;
+		eth->gdm4_link_up = false;
 		ret = airoha_recovery_rtl8261_set_power(eth, RTL8261_PHY5_ADDR, false);
 		if (ret) {
 			printf("airoha: recovery PHY %d power-down failed: %d\n",
@@ -4520,11 +4720,18 @@ void airoha_recovery_poll_link(struct udevice *dev)
 	if (env_get("recovery_debug") &&
 	    (!dbg_last_ms || now - dbg_last_ms >= 5000)) {
 		dbg_last_ms = now;
-		printf("airoha: dbg pcs=%d usx=%d rxsig=%d gdm4_up=%d spd=%u fport[def=%u tx=%u rx=%u]\n",
+		bool dbg_copper = false;
+		u16 dbg_speed = 0;
+
+		airoha_rtl8261_copper_get(eth, RTL8261_PHY5_ADDR, &dbg_copper,
+					  &dbg_speed);
+		printf("airoha: dbg copper=%d spd=%u pcs=%d usx=%d rxsig=%d gdm4[cfg=%d up=%d retry=%u] fport[def=%u tx=%u rx=%u]\n",
+		       dbg_copper, dbg_speed,
 		       !!airoha_gdm4_pcs_link_up(eth),
 		       !!airoha_usxgmii_link_up(eth),
 		       !!airoha_eth_gdm4_have_rx_signal(eth),
-		       eth->gdm4_link_up, eth->gdm4_link_speed,
+		       eth->gdm4_configured, eth->gdm4_link_up,
+		       eth->gdm4_retrain_count,
 		       eth->default_tx_fport, eth->last_tx_fport,
 		       eth->last_rx_fport);
 	}
@@ -5044,6 +5251,18 @@ static void airoha_qdma_reset_rx_desc(struct airoha_queue *q, int index)
 	index = (index + 1) % q->ndesc;
 
 	/*
+	 * Two 32-byte RX descriptors share one 64-byte cache line. Drop any
+	 * stale CPU copy of that line before rewriting this descriptor:
+	 * otherwise the flush below would also write back an outdated DONE
+	 * bit for the neighbouring descriptor and silently lose hardware
+	 * progress. With this in place a single descriptor can be recycled on
+	 * its own, matching the Linux ownership model instead of the even/odd
+	 * pair workaround.
+	 */
+	invalidate_dcache_range((ulong)desc & ~(ARCH_DMA_MINALIGN - 1),
+				ALIGN((ulong)desc + sizeof(*desc), ARCH_DMA_MINALIGN));
+
+	/*
 	 * Keep RX descriptor programming aligned with upstream U-Boot:
 	 * publish the packet buffer itself to hardware and perform the
 	 * cache sync in the TX-direction before ownership is handed over
@@ -5405,6 +5624,10 @@ static void airoha_recovery_runtime_reset(struct airoha_eth *eth)
 	eth->last_rx_fport = 0;
 	eth->gdm4_link_up = false;
 	eth->gdm4_copper_link_up = false;
+	/* Any reset invalidates the "PHY/PCS is configured" state as well. */
+	eth->gdm4_configured = false;
+	eth->gdm4_retrain_count = 0;
+	eth->gdm4_configured_ms = 0;
 	eth->recovery_link_poll_started = false;
 	eth->recovery_lan_wake_pending = 0;
 	eth->rtl8261_phy5_wake_pending = false;
@@ -5678,6 +5901,26 @@ static int airoha_eth_probe(struct udevice *dev)
 	if (IS_ERR(chip_scu_regmap))
 		return PTR_ERR(chip_scu_regmap);
 	eth->chip_scu_regmap = chip_scu_regmap;
+
+	/*
+	 * Read the EN7581 product id once. Linux uses it to decide whether the
+	 * PCS needs the manual RX calibration path (SoC before E2 revision);
+	 * print it so field debugging can match the two implementations.
+	 */
+	{
+		u32 pdidr = 0;
+
+		if (!regmap_read(eth->chip_scu_regmap, AIROHA_EN7581_SCU_PDIDR,
+				 &pdidr)) {
+			eth->soc_product_id = FIELD_GET(AIROHA_EN7581_SCU_PRODUCT_ID,
+							pdidr);
+			eth->manual_rx_calib = eth->soc_product_id < 0x2;
+			printf("airoha: SoC product id 0x%x - PCS RX calibration: %s\n",
+			       eth->soc_product_id,
+			       eth->manual_rx_calib ? "manual (pre-E2)" :
+						      "automatic (E2+)");
+		}
+	}
 
 	eth->default_tx_fport = 1;
 	eth->last_tx_fport = 0;
@@ -6027,28 +6270,15 @@ static void airoha_qdma_recycle_rx_desc(struct airoha_qdma *qdma,
 					struct airoha_queue *q, int qid)
 {
 	/*
-	 * Due to cpu cache issue the airoha_qdma_reset_rx_desc() function
-	 * will always touch 2 descriptors placed on the same cacheline:
-	 *   - if current descriptor is even, then current and next
-	 *     descriptors will be touched
-	 *   - if current descriptor is odd, then current and previous
-	 *     descriptors will be touched
-	 *
-	 * Thus, to prevent possible destroying of rx queue, we should:
-	 *   - do nothing in the even descriptor case,
-	 *   - utilize 2 descriptors (current and previous one) in the
-	 *     odd descriptor case.
-	 *
-	 * WARNING: Observations shows that PKTBUFSRX must be even and
-	 *          larger than 7 for reliable driver operations.
+	 * Recycle exactly one descriptor. The cache-line hazard that used to
+	 * force even/odd pair handling is handled by the invalidate-before-write
+	 * in airoha_qdma_reset_rx_desc(), so the ring follows the Linux model:
+	 * consume one, refill one, publish one.
 	 */
-	if (q->head & 0x01) {
-		airoha_qdma_reset_rx_desc(q, q->head - 1);
-		airoha_qdma_reset_rx_desc(q, q->head);
+	airoha_qdma_reset_rx_desc(q, q->head);
 
-		airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
-				FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
-	}
+	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
+			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
 
 	q->head = (q->head + 1) % q->ndesc;
 }

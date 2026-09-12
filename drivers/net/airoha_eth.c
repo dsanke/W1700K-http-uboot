@@ -628,12 +628,61 @@ struct airoha_qdma_fwd_desc {
 	__le32 rsv1;
 };
 
+/*
+ * U-Boot's dma_alloc_coherent() is only memalign(), so the QDMA RX descriptor
+ * ring lives in cacheable memory.  ARCH_DMA_MINALIGN / sizeof(desc) descriptors
+ * therefore share one cache line: whenever the CPU writes (dirties) such a
+ * line, the write-back can overwrite a DONE bit the QDMA stored in a
+ * neighbouring descriptor and the ring silently stops making progress.
+ *
+ * Linux does not have this problem - dmam_alloc_coherent() returns genuinely
+ * non-cached memory on this non-coherent SoC - which is why the Linux driver
+ * can recycle one descriptor at a time.
+ *
+ * The recovery driver therefore:
+ *   - consumes one descriptor at a time, so a packet is delivered as soon as
+ *     it arrived and never waits for a cache-line partner;
+ *   - keeps all buffer ownership state outside the descriptor memory;
+ *   - only rewrites a cache line that the QDMA can no longer reach;
+ *   - publishes the ring boundary in whole cache lines and keeps one whole
+ *     cache line unpublished as the hardware gap.
+ */
+#define AIROHA_RX_DESCS_PER_LINE \
+	(ARCH_DMA_MINALIGN / sizeof(struct airoha_qdma_desc))
+
+enum airoha_rx_slot_state {
+	AIROHA_RX_SLOT_UNPUBLISHED = 0,	/* never handed to the QDMA (gap) */
+	AIROHA_RX_SLOT_HW,		/* published, QDMA may write it */
+	AIROHA_RX_SLOT_DONE,		/* DONE seen, packet handed to caller */
+	AIROHA_RX_SLOT_RELEASED,	/* caller released the buffer */
+};
+
 struct airoha_queue {
 	struct airoha_qdma_desc *desc;
 	uchar *rx_buf;
 	uchar *tx_buf;
 	u16 head;
-	bool rx_head_aligned;
+
+	/*
+	 * RX ownership bookkeeping.  Deliberately kept outside the descriptor
+	 * memory so that updating it can never dirty a descriptor cache line.
+	 */
+	u16 rx_consume;		/* oldest published descriptor, next to consume */
+	u16 rx_recycle;		/* published boundary: first unpublished slot */
+	u16 rx_inflight;	/* published descriptors not consumed yet */
+	u16 rx_epoch;		/* bumped on every ring (re)initialisation */
+	u16 rx_pub_from;	/* last published range (diagnostics) */
+	u16 rx_pub_to;
+	u16 rx_pub_epoch;
+	u32 rx_recycled;	/* descriptors handed back to the QDMA */
+	u32 rx_wraps;		/* consume pointer wrapped around the ring */
+	u32 rx_illegal_touch;	/* tried to dirty a QDMA-reachable line */
+	u32 rx_reuse_not_released;	/* reprepare before buffer release */
+	u32 rx_generation_mismatch;	/* stale/double free, wrong pointer */
+	u32 rx_reset_busy;	/* ring rewritten while RX DMA still busy */
+	u8 rx_state[RX_DSCP_NUM];
+
+	bool rx_aligned;
 	bool rx_drop_chain;
 	bool pending;
 
@@ -732,6 +781,9 @@ struct airoha_eth {
 	u32 tx_attempts;
 	u32 tx_ok;
 	u32 tx_err;
+	u32 rx_ok;
+	u32 rx_drop;
+	u32 rx_free_unmatched;
 	u8 last_tx_dst[ARP_HLEN];
 	u8 last_tx_src[ARP_HLEN];
 	u16 last_tx_ethertype;
@@ -3358,6 +3410,7 @@ static void airoha_eth_gdm4_diag(struct airoha_eth *eth, const char *tag,
 	u32 qdma1_tx0 = 0, qdma1_tx1 = 0, qdma1_rx0 = 0, qdma1_rx1 = 0;
 	u16 qdma0_head = 0, qdma0_cpu_idx = 0, qdma0_dma_idx = 0;
 	u16 qdma1_head = 0, qdma1_cpu_idx = 0, qdma1_dma_idx = 0;
+	struct airoha_queue *q0 = NULL, *q1 = NULL;
 	u32 qdma0_desc_ctrl = 0, qdma0_desc_addr = 0, qdma0_desc_msg1 = 0;
 	u32 qdma1_desc_ctrl = 0, qdma1_desc_addr = 0, qdma1_desc_msg1 = 0;
 	u32 fe_lan_mac_h = 0, fe_lan_mac_lmin = 0, fe_wan_mac_h = 0, fe_wan_mac_lmin = 0;
@@ -3494,13 +3547,14 @@ static void airoha_eth_gdm4_diag(struct airoha_eth *eth, const char *tag,
 
 	if (airoha_qdma_ready(&eth->qdma[0])) {
 		struct airoha_queue *q = &eth->qdma[0].q_rx[0];
-		struct airoha_qdma_desc *desc = &q->desc[q->head];
+		struct airoha_qdma_desc *desc = &q->desc[q->rx_consume];
 
+		q0 = q;
 		qdma0_tx0 = airoha_qdma_rr(&eth->qdma[0], REG_QDMA_DBG_TX_BASE + 0x0);
 		qdma0_tx1 = airoha_qdma_rr(&eth->qdma[0], REG_QDMA_DBG_TX_BASE + 0x4);
 		qdma0_rx0 = airoha_qdma_rr(&eth->qdma[0], REG_QDMA_DBG_RX_BASE + 0x0);
 		qdma0_rx1 = airoha_qdma_rr(&eth->qdma[0], REG_QDMA_DBG_RX_BASE + 0x4);
-		qdma0_head = q->head;
+		qdma0_head = q->rx_consume;
 		qdma0_cpu_idx = FIELD_GET(RX_RING_CPU_IDX_MASK,
 					 airoha_qdma_rr(&eth->qdma[0], REG_RX_CPU_IDX(0)));
 		qdma0_dma_idx = FIELD_GET(RX_RING_DMA_IDX_MASK,
@@ -3512,13 +3566,14 @@ static void airoha_eth_gdm4_diag(struct airoha_eth *eth, const char *tag,
 
 	if (airoha_qdma_ready(&eth->qdma[1])) {
 		struct airoha_queue *q = &eth->qdma[1].q_rx[0];
-		struct airoha_qdma_desc *desc = &q->desc[q->head];
+		struct airoha_qdma_desc *desc = &q->desc[q->rx_consume];
 
+		q1 = q;
 		qdma1_tx0 = airoha_qdma_rr(&eth->qdma[1], REG_QDMA_DBG_TX_BASE + 0x0);
 		qdma1_tx1 = airoha_qdma_rr(&eth->qdma[1], REG_QDMA_DBG_TX_BASE + 0x4);
 		qdma1_rx0 = airoha_qdma_rr(&eth->qdma[1], REG_QDMA_DBG_RX_BASE + 0x0);
 		qdma1_rx1 = airoha_qdma_rr(&eth->qdma[1], REG_QDMA_DBG_RX_BASE + 0x4);
-		qdma1_head = q->head;
+		qdma1_head = q->rx_consume;
 		qdma1_cpu_idx = FIELD_GET(RX_RING_CPU_IDX_MASK,
 					 airoha_qdma_rr(&eth->qdma[1], REG_RX_CPU_IDX(0)));
 		qdma1_dma_idx = FIELD_GET(RX_RING_DMA_IDX_MASK,
@@ -3576,11 +3631,27 @@ static void airoha_eth_gdm4_diag(struct airoha_eth *eth, const char *tag,
 	       phy10_ctrl, phy10_stat, airoha_recovery_lan_power_down_ms);
 	printf("rtl8261: %s xfi gib=%08x rst=%08x\n", tag ? tag : "diag",
 	       xfi_gib_cfg, xfi_logic_rst);
-	printf("rtl8261: %s qdma0 rxring head=%u cpu=%u dma=%u desc[ctrl=%08x addr=%08x msg1=%08x]\n",
-	       tag ? tag : "diag", qdma0_head, qdma0_cpu_idx, qdma0_dma_idx,
+	printf("rtl8261: %s qdma0 rxring consume=%u pub=%u inflight=%u cpu=%u dma=%u epoch=%u recycled=%u wrap=%u lastpub[%u->%u e%u] bad[touch=%u reuse=%u gen=%u busy=%u] desc[ctrl=%08x addr=%08x msg1=%08x]\n",
+	       tag ? tag : "diag", qdma0_head,
+	       q0 ? q0->rx_recycle : 0, q0 ? q0->rx_inflight : 0,
+	       qdma0_cpu_idx, qdma0_dma_idx, q0 ? q0->rx_epoch : 0,
+	       q0 ? q0->rx_recycled : 0, q0 ? q0->rx_wraps : 0,
+	       q0 ? q0->rx_pub_from : 0, q0 ? q0->rx_pub_to : 0,
+	       q0 ? q0->rx_pub_epoch : 0, q0 ? q0->rx_illegal_touch : 0,
+	       q0 ? q0->rx_reuse_not_released : 0,
+	       q0 ? q0->rx_generation_mismatch : 0,
+	       q0 ? q0->rx_reset_busy : 0,
 	       qdma0_desc_ctrl, qdma0_desc_addr, qdma0_desc_msg1);
-	printf("rtl8261: %s qdma1 rxring head=%u cpu=%u dma=%u desc[ctrl=%08x addr=%08x msg1=%08x]\n",
-	       tag ? tag : "diag", qdma1_head, qdma1_cpu_idx, qdma1_dma_idx,
+	printf("rtl8261: %s qdma1 rxring consume=%u pub=%u inflight=%u cpu=%u dma=%u epoch=%u recycled=%u wrap=%u lastpub[%u->%u e%u] bad[touch=%u reuse=%u gen=%u busy=%u] desc[ctrl=%08x addr=%08x msg1=%08x]\n",
+	       tag ? tag : "diag", qdma1_head,
+	       q1 ? q1->rx_recycle : 0, q1 ? q1->rx_inflight : 0,
+	       qdma1_cpu_idx, qdma1_dma_idx, q1 ? q1->rx_epoch : 0,
+	       q1 ? q1->rx_recycled : 0, q1 ? q1->rx_wraps : 0,
+	       q1 ? q1->rx_pub_from : 0, q1 ? q1->rx_pub_to : 0,
+	       q1 ? q1->rx_pub_epoch : 0, q1 ? q1->rx_illegal_touch : 0,
+	       q1 ? q1->rx_reuse_not_released : 0,
+	       q1 ? q1->rx_generation_mismatch : 0,
+	       q1 ? q1->rx_reset_busy : 0,
 	       qdma1_desc_ctrl, qdma1_desc_addr, qdma1_desc_msg1);
 	printf("rtl8261: %s pkt tx[attempt=%u ok=%u err=%u ret=%d fport=%u hw=%u len=%u type=%04x dst=%pM src=%pM] rx_head[%u]=%02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x %02x%02x%02x%02x\n",
 	       tag ? tag : "diag", eth->tx_attempts, eth->tx_ok, eth->tx_err,
@@ -4725,7 +4796,7 @@ void airoha_recovery_poll_link(struct udevice *dev)
 
 		airoha_rtl8261_copper_get(eth, RTL8261_PHY5_ADDR, &dbg_copper,
 					  &dbg_speed);
-		printf("airoha: dbg copper=%d spd=%u pcs=%d usx=%d rxsig=%d gdm4[cfg=%d up=%d retry=%u] fport[def=%u tx=%u rx=%u]\n",
+		printf("airoha: dbg copper=%d spd=%u pcs=%d usx=%d rxsig=%d gdm4[cfg=%d up=%d retry=%u] fport[def=%u tx=%u rx=%u] rx[ok=%u drop=%u unmatch=%u q0=cons%u/pub%u/infl%u/bad%u q1=cons%u/pub%u/infl%u/bad%u]\n",
 		       dbg_copper, dbg_speed,
 		       !!airoha_gdm4_pcs_link_up(eth),
 		       !!airoha_usxgmii_link_up(eth),
@@ -4733,7 +4804,16 @@ void airoha_recovery_poll_link(struct udevice *dev)
 		       eth->gdm4_configured, eth->gdm4_link_up,
 		       eth->gdm4_retrain_count,
 		       eth->default_tx_fport, eth->last_tx_fport,
-		       eth->last_rx_fport);
+		       eth->last_rx_fport,
+		       eth->rx_ok, eth->rx_drop, eth->rx_free_unmatched,
+		       eth->qdma[0].q_rx[0].rx_consume,
+		       eth->qdma[0].q_rx[0].rx_recycle,
+		       eth->qdma[0].q_rx[0].rx_inflight,
+		       eth->qdma[0].q_rx[0].rx_illegal_touch,
+		       eth->qdma[1].q_rx[0].rx_consume,
+		       eth->qdma[1].q_rx[0].rx_recycle,
+		       eth->qdma[1].q_rx[0].rx_inflight,
+		       eth->qdma[1].q_rx[0].rx_illegal_touch);
 	}
 
 	if (eth->recovery_link_poll_started &&
@@ -5240,27 +5320,45 @@ static void airoha_enable_mdio_pins(struct airoha_eth *eth)
 	airoha_gpio_set_active_low(2, 0);
 }
 
-static void airoha_qdma_reset_rx_desc(struct airoha_queue *q, int index)
+static const char *airoha_rx_slot_state_name(u8 state)
 {
-	struct airoha_qdma_desc *desc;
-	uchar *rx_packet;
+	switch (state) {
+	case AIROHA_RX_SLOT_UNPUBLISHED:
+		return "gap";
+	case AIROHA_RX_SLOT_HW:
+		return "hw";
+	case AIROHA_RX_SLOT_DONE:
+		return "done";
+	case AIROHA_RX_SLOT_RELEASED:
+		return "free";
+	default:
+		return "?";
+	}
+}
+
+/*
+ * True while the QDMA may still write this descriptor.  The hardware walks the
+ * published arc [rx_consume, rx_recycle); testing that arc is conservative and
+ * also covers descriptors that were published but not written by the hardware
+ * yet.  This is the predicate guarding every CPU write into the descriptor
+ * ring.
+ */
+static bool airoha_rx_desc_hw_reachable(struct airoha_queue *q, u16 index)
+{
+	u16 rel = (u16)((index + q->ndesc - q->rx_consume) % q->ndesc);
+
+	return rel < q->rx_inflight;
+}
+
+/*
+ * (Re)program one descriptor for receive.  Performs no cache maintenance:
+ * callers must run inside airoha_rx_prepare_line().
+ */
+static void airoha_qdma_fill_rx_desc(struct airoha_queue *q, u16 index)
+{
+	struct airoha_qdma_desc *desc = &q->desc[index];
+	uchar *rx_packet = q->rx_buf + (index * AIROHA_RX_BUF_SIZE);
 	u32 val;
-
-	desc = &q->desc[index];
-	rx_packet = q->rx_buf + (index * AIROHA_RX_BUF_SIZE);
-	index = (index + 1) % q->ndesc;
-
-	/*
-	 * Two 32-byte RX descriptors share one 64-byte cache line. Drop any
-	 * stale CPU copy of that line before rewriting this descriptor:
-	 * otherwise the flush below would also write back an outdated DONE
-	 * bit for the neighbouring descriptor and silently lose hardware
-	 * progress. With this in place a single descriptor can be recycled on
-	 * its own, matching the Linux ownership model instead of the even/odd
-	 * pair workaround.
-	 */
-	invalidate_dcache_range((ulong)desc & ~(ARCH_DMA_MINALIGN - 1),
-				ALIGN((ulong)desc + sizeof(*desc), ARCH_DMA_MINALIGN));
 
 	/*
 	 * Keep RX descriptor programming aligned with upstream U-Boot:
@@ -5275,19 +5373,198 @@ static void airoha_qdma_reset_rx_desc(struct airoha_queue *q, int index)
 	WRITE_ONCE(desc->msg2, cpu_to_le32(0));
 	WRITE_ONCE(desc->msg3, cpu_to_le32(0));
 	WRITE_ONCE(desc->addr, cpu_to_le32(virt_to_phys(rx_packet)));
-	WRITE_ONCE(desc->data, cpu_to_le32(index));
+	WRITE_ONCE(desc->data, cpu_to_le32((index + 1) % q->ndesc));
 	val = FIELD_PREP(QDMA_DESC_LEN_MASK, AIROHA_RX_BUF_SIZE);
 	WRITE_ONCE(desc->ctrl, cpu_to_le32(val));
-
-	dma_map_unaligned(desc, sizeof(*desc), DMA_TO_DEVICE);
 }
 
-static void airoha_qdma_init_rx_desc(struct airoha_queue *q)
+/*
+ * Rewrite the descriptors of one cache line and flush that line exactly once.
+ *
+ * The whole line must be CPU-owned and every buffer it points at must have
+ * been released before the line is dirtied.  A descriptor that was overwritten
+ * while the QDMA still owned it cannot be repaired afterwards, so a violation
+ * is refused (and recorded) instead of counted and ignored.
+ */
+static int airoha_rx_prepare_line(struct airoha_qdma *qdma,
+				  struct airoha_queue *q, u16 line)
 {
+	u16 first = line * AIROHA_RX_DESCS_PER_LINE;
+	struct airoha_qdma_desc *desc = &q->desc[first];
+	ulong start = ALIGN_DOWN((ulong)desc, ARCH_DMA_MINALIGN);
+	int qid = q - &qdma->q_rx[0];
 	int i;
 
-	for (i = 0; i < q->ndesc; i++)
-		airoha_qdma_reset_rx_desc(q, i);
+	for (i = 0; i < AIROHA_RX_DESCS_PER_LINE; i++) {
+		u16 index = (first + i) % q->ndesc;
+
+		if (airoha_rx_desc_hw_reachable(q, index)) {
+			q->rx_illegal_touch++;
+			printf("airoha: qdma%d rx: refusing to dirty line %u, desc %u still reachable by the QDMA (consume=%u pub=%u inflight=%u epoch=%u)\n",
+			       qid, line, index, q->rx_consume, q->rx_recycle,
+			       q->rx_inflight, q->rx_epoch);
+			return -EBUSY;
+		}
+
+		if (q->rx_state[index] == AIROHA_RX_SLOT_DONE) {
+			q->rx_reuse_not_released++;
+			printf("airoha: qdma%d rx: refusing to reuse desc %u, buffer still held (state=%s epoch=%u)\n",
+			       qid, index,
+			       airoha_rx_slot_state_name(q->rx_state[index]),
+			       q->rx_epoch);
+			return -EBUSY;
+		}
+	}
+
+	/*
+	 * Drop any stale CPU copy of the line, rewrite every descriptor on it,
+	 * then clean+invalidate the line once so the QDMA can never observe a
+	 * partially updated cache line.
+	 */
+	invalidate_dcache_range(start, start + ARCH_DMA_MINALIGN);
+
+	for (i = 0; i < AIROHA_RX_DESCS_PER_LINE; i++) {
+		u16 index = (first + i) % q->ndesc;
+
+		airoha_qdma_fill_rx_desc(q, index);
+	}
+
+	dma_map_unaligned(desc, ARCH_DMA_MINALIGN, DMA_TO_DEVICE);
+
+	for (i = 0; i < AIROHA_RX_DESCS_PER_LINE; i++) {
+		u16 index = (first + i) % q->ndesc;
+
+		q->rx_state[index] = AIROHA_RX_SLOT_HW;
+	}
+
+	return 0;
+}
+
+/*
+ * Hand whole cache lines back to the QDMA.  Only the line at the published
+ * boundary is rewritten, and only while at least one whole cache line stays
+ * unpublished as the hardware gap.
+ */
+static void airoha_rx_recycle_lines(struct airoha_qdma *qdma,
+				    struct airoha_queue *q)
+{
+	u16 max_inflight = q->ndesc - AIROHA_RX_DESCS_PER_LINE;
+	int qid = q - &qdma->q_rx[0];
+
+	while (q->rx_inflight + AIROHA_RX_DESCS_PER_LINE <= max_inflight) {
+		u16 from = q->rx_recycle;
+		u16 to;
+
+		if (airoha_rx_prepare_line(qdma, q,
+					   q->rx_recycle /
+						   AIROHA_RX_DESCS_PER_LINE))
+			break;
+
+		to = from + AIROHA_RX_DESCS_PER_LINE;
+		if (to >= q->ndesc)
+			to -= q->ndesc;
+
+		q->rx_pub_from = from;
+		q->rx_pub_to = to;
+		q->rx_pub_epoch = q->rx_epoch;
+		q->rx_recycle = to;
+		q->rx_inflight += AIROHA_RX_DESCS_PER_LINE;
+		q->rx_recycled += AIROHA_RX_DESCS_PER_LINE;
+
+		/*
+		 * The descriptor stores and the cache maintenance above must
+		 * have completed before the QDMA is told it may use them again.
+		 */
+		wmb();
+		airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
+				FIELD_PREP(RX_RING_CPU_IDX_MASK, to));
+	}
+}
+
+/*
+ * Mark the unpublished gap line as "not free" (DONE set).  Slots between laps
+ * keep their DONE bit anyway; this only matters right after a reset, when the
+ * freshly zeroed ring would otherwise look completely free.  It makes the
+ * hardware stop at the same descriptor whether it finds its free descriptors
+ * through CPU_IDX or through the DONE bits.
+ */
+static void airoha_rx_mark_gap_line(struct airoha_qdma *qdma,
+				    struct airoha_queue *q)
+{
+	u16 first = q->rx_recycle;
+	struct airoha_qdma_desc *desc = &q->desc[first];
+	ulong start = ALIGN_DOWN((ulong)desc, ARCH_DMA_MINALIGN);
+	int qid = q - &qdma->q_rx[0];
+	int i;
+
+	for (i = 0; i < AIROHA_RX_DESCS_PER_LINE; i++) {
+		u16 index = (first + i) % q->ndesc;
+
+		if (airoha_rx_desc_hw_reachable(q, index)) {
+			q->rx_illegal_touch++;
+			printf("airoha: qdma%d rx: refusing to close gap line %u, desc %u still reachable (inflight=%u)\n",
+			       qid, first, index, q->rx_inflight);
+			return;
+		}
+	}
+
+	invalidate_dcache_range(start, start + ARCH_DMA_MINALIGN);
+
+	for (i = 0; i < AIROHA_RX_DESCS_PER_LINE; i++) {
+		u16 index = (first + i) % q->ndesc;
+
+		/*
+		 * Keep the chain fields valid (address / next index) and only
+		 * mark the descriptor as not free, exactly like a descriptor
+		 * that has been filled but not handed back yet.
+		 */
+		airoha_qdma_fill_rx_desc(q, index);
+		WRITE_ONCE(q->desc[index].ctrl,
+			   cpu_to_le32(FIELD_PREP(QDMA_DESC_LEN_MASK,
+						  AIROHA_RX_BUF_SIZE) |
+				       QDMA_DESC_DONE_MASK));
+	}
+
+	dma_map_unaligned(desc, ARCH_DMA_MINALIGN, DMA_TO_DEVICE);
+}
+
+/*
+ * Mark one descriptor as consumed.  The descriptor memory itself is only
+ * rewritten later, from airoha_rx_recycle_lines(), once its whole cache line
+ * is CPU-owned again.
+ */
+static void airoha_rx_consume_desc(struct airoha_queue *q, u16 index,
+				   bool delivered)
+{
+	q->rx_state[index] = delivered ? AIROHA_RX_SLOT_DONE :
+					 AIROHA_RX_SLOT_RELEASED;
+	q->rx_consume = (index + 1) % q->ndesc;
+	if (q->rx_inflight)
+		q->rx_inflight--;
+	if (!q->rx_consume)
+		q->rx_wraps++;
+}
+
+static void airoha_rx_release_desc(struct airoha_queue *q, u16 index)
+{
+	if (q->rx_state[index] == AIROHA_RX_SLOT_DONE)
+		q->rx_state[index] = AIROHA_RX_SLOT_RELEASED;
+	else
+		q->rx_generation_mismatch++;
+}
+
+static void airoha_qdma_reset_rx_state(struct airoha_queue *q)
+{
+	q->rx_epoch++;
+	q->rx_consume = 0;
+	q->rx_recycle = 0;
+	q->rx_inflight = 0;
+	q->rx_pub_from = 0;
+	q->rx_pub_to = 0;
+	q->rx_pub_epoch = q->rx_epoch;
+	q->rx_aligned = false;
+	q->rx_drop_chain = false;
+	memset(q->rx_state, AIROHA_RX_SLOT_UNPUBLISHED, sizeof(q->rx_state));
 }
 
 static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
@@ -5297,9 +5574,14 @@ static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
 	unsigned long dma_addr;
 	size_t rx_buf_size;
 
+	if (ndesc > RX_DSCP_NUM || ndesc % AIROHA_RX_DESCS_PER_LINE) {
+		printf("airoha: qdma%d rx: invalid ring size %d\n", qid, ndesc);
+		return -EINVAL;
+	}
+
 	q->ndesc = ndesc;
 	q->head = 0;
-	q->rx_head_aligned = false;
+	q->rx_aligned = false;
 	q->rx_drop_chain = false;
 
 	rx_buf_size = ALIGN(q->ndesc * AIROHA_RX_BUF_SIZE, ARCH_DMA_MINALIGN);
@@ -5322,10 +5604,14 @@ static int airoha_qdma_init_rx_queue(struct airoha_queue *q,
 
 	airoha_qdma_rmw(qdma, REG_RX_RING_SIZE(qid), RX_RING_THR_MASK,
 			FIELD_PREP(RX_RING_THR_MASK, 0));
-	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
-			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->ndesc - 1));
+	/* Start with an empty published arc and prime it through one path. */
+	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK, 0);
 	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK,
-			FIELD_PREP(RX_RING_DMA_IDX_MASK, q->head));
+			FIELD_PREP(RX_RING_DMA_IDX_MASK, 0));
+
+	airoha_qdma_reset_rx_state(q);
+	airoha_rx_recycle_lines(qdma, q);
+	airoha_rx_mark_gap_line(qdma, q);
 
 	return 0;
 }
@@ -5552,17 +5838,29 @@ static void airoha_qdma_reset_tx_ring(struct airoha_qdma *qdma, int qid)
 static void airoha_qdma_reset_rx_ring(struct airoha_qdma *qdma, int qid)
 {
 	struct airoha_queue *q = &qdma->q_rx[qid];
+	u32 cfg;
 
 	if (!q->ndesc || !q->desc)
 		return;
 
-	q->head = 0;
-	q->rx_head_aligned = false;
-	q->rx_drop_chain = false;
-	airoha_qdma_init_rx_desc(q);
-	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
-			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->ndesc - 1));
+	/*
+	 * Rewriting the ring is only safe while the RX DMA is stopped.  The
+	 * caller runs airoha_qdma_stop_dma() first; report (instead of hiding)
+	 * the case where the hardware still reports busy.
+	 */
+	cfg = airoha_qdma_rr(qdma, REG_QDMA_GLOBAL_CFG);
+	if (cfg & GLOBAL_CFG_RX_DMA_BUSY_MASK) {
+		q->rx_reset_busy++;
+		printf("airoha: qdma%d rx%d: ring reset while RX DMA busy (cfg=%08x epoch=%u)\n",
+		       (int)(qdma - qdma->eth->qdma), qid, cfg,
+		       q->rx_epoch + 1);
+	}
+
+	airoha_qdma_reset_rx_state(q);
+	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK, 0);
 	airoha_qdma_rmw(qdma, REG_RX_DMA_IDX(qid), RX_RING_DMA_IDX_MASK, 0);
+	airoha_rx_recycle_lines(qdma, q);
+	airoha_rx_mark_gap_line(qdma, q);
 }
 
 static int airoha_qdma_runtime_reset(struct airoha_qdma *qdma)
@@ -6266,23 +6564,6 @@ static int airoha_eth_send(struct udevice *dev, void *packet, int length)
 	return airoha_eth_send_on_fport(dev, packet, length, fport);
 }
 
-static void airoha_qdma_recycle_rx_desc(struct airoha_qdma *qdma,
-					struct airoha_queue *q, int qid)
-{
-	/*
-	 * Recycle exactly one descriptor. The cache-line hazard that used to
-	 * force even/odd pair handling is handled by the invalidate-before-write
-	 * in airoha_qdma_reset_rx_desc(), so the ring follows the Linux model:
-	 * consume one, refill one, publish one.
-	 */
-	airoha_qdma_reset_rx_desc(q, q->head);
-
-	airoha_qdma_rmw(qdma, REG_RX_CPU_IDX(qid), RX_RING_CPU_IDX_MASK,
-			FIELD_PREP(RX_RING_CPU_IDX_MASK, q->head));
-
-	q->head = (q->head + 1) % q->ndesc;
-}
-
 static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma,
 				uchar **packetp)
 {
@@ -6292,26 +6573,38 @@ static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma
 	u32 desc_ctrl, msg1;
 	u8 qdma_id = qdma - &eth->qdma[0];
 	u8 sport, crsn;
-	u16 ppe_entry, length;
+	u16 ppe_entry, length, index;
 	uchar *packet;
 	bool more;
 	int n, qid;
 
 	qid = 0;
 	q = &qdma->q_rx[qid];
-	desc = &q->desc[q->head];
+	/*
+	 * With an empty published arc there is nothing the QDMA can have
+	 * completed; reading past the boundary would pick up a descriptor of an
+	 * older lap (the gap line) and deliver a stale packet.
+	 */
+	if (!q->rx_inflight)
+		return -EAGAIN;
+
+	index = q->rx_consume;
+	desc = &q->desc[index];
 
 	dma_unmap_unaligned(virt_to_phys(desc), sizeof(*desc), DMA_FROM_DEVICE);
 
 	desc_ctrl = le32_to_cpu(desc->ctrl);
 	/*
 	 * XR1710G can start filling RX at descriptor 2 even though software reset
-	 * the consumer to 0. Find that initial even descriptor once, then keep
-	 * strict ring order. Runtime scanning would rediscover an already-consumed
-	 * even descriptor, which remains DONE until its odd partner is recycled.
+	 * the consumer to 0. Find that initial cache-line-aligned descriptor once
+	 * per ring epoch, then keep strict ring order. The jumped-over slots were
+	 * never written by the QDMA in this epoch, so their buffers go straight
+	 * back to the free pool.  Only published descriptors are searched, the
+	 * unpublished gap line is closed with DONE set and must not be picked up.
 	 */
-	if (!(desc_ctrl & QDMA_DESC_DONE_MASK) && !q->rx_head_aligned) {
-		for (n = 2; n < q->ndesc; n += 2) {
+	if (!(desc_ctrl & QDMA_DESC_DONE_MASK) && !q->rx_aligned) {
+		for (n = AIROHA_RX_DESCS_PER_LINE; n < q->rx_recycle;
+		     n += AIROHA_RX_DESCS_PER_LINE) {
 			desc = &q->desc[n];
 			dma_unmap_unaligned(virt_to_phys(desc), sizeof(*desc),
 					    DMA_FROM_DEVICE);
@@ -6319,14 +6612,23 @@ static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma
 			if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
 				continue;
 
-			q->head = n;
+			for (index = 0; index < n; index++) {
+				if (q->rx_state[index] == AIROHA_RX_SLOT_HW)
+					q->rx_state[index] =
+						AIROHA_RX_SLOT_RELEASED;
+			}
+
+			q->rx_consume = n;
+			q->rx_inflight = (u16)((q->rx_recycle + q->ndesc - n) %
+					       q->ndesc);
+			index = n;
 			break;
 		}
 	}
 
 	if (!(desc_ctrl & QDMA_DESC_DONE_MASK))
 		return -EAGAIN;
-	q->rx_head_aligned = true;
+	q->rx_aligned = true;
 
 	dma_addr = le32_to_cpu(desc->addr);
 	if (dma_addr)
@@ -6341,7 +6643,9 @@ static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma
 	 */
 	if (q->rx_drop_chain || !length || length > AIROHA_RX_BUF_SIZE || more) {
 		q->rx_drop_chain = more;
-		airoha_qdma_recycle_rx_desc(qdma, q, qid);
+		airoha_rx_consume_desc(q, index, false);
+		airoha_rx_recycle_lines(qdma, q);
+		eth->rx_drop++;
 		return -EAGAIN;
 	}
 
@@ -6365,18 +6669,27 @@ static int airoha_eth_recv_qdma(struct airoha_eth *eth, struct airoha_qdma *qdma
 	eth->last_rx_qdma = qdma_id;
 	eth->last_rx_sport = sport;
 	eth->last_rx_crsn = crsn;
-	eth->last_rx_index = q->head;
+	eth->last_rx_index = index;
 	eth->last_rx_ppe_entry = ppe_entry;
 	eth->last_rx_len = length;
 	eth->last_rx_ctrl = desc_ctrl;
 	eth->last_rx_msg1 = msg1;
 
-	packet = q->rx_buf + (q->head * AIROHA_RX_BUF_SIZE);
+	packet = q->rx_buf + (index * AIROHA_RX_BUF_SIZE);
 	airoha_recovery_copy_head(eth->last_rx_head, &eth->last_rx_head_len,
 				  packet, length);
 	if (length >= 12)
 		airoha_peer_fport_learn(eth, packet + ARP_HLEN,
 					 eth->last_rx_fport);
+
+	/*
+	 * Consume exactly this descriptor.  Its cache line is only rewritten
+	 * later, when both descriptors on it are CPU-owned again, which keeps
+	 * packet delivery independent of the cache-line granularity.
+	 */
+	airoha_rx_consume_desc(q, index, true);
+	airoha_rx_recycle_lines(qdma, q);
+	eth->rx_ok++;
 
 	*packetp = packet;
 
@@ -6408,20 +6721,41 @@ static int airoha_eth_recv(struct udevice *dev, int flags, uchar **packetp)
 static int arht_eth_free_pkt(struct udevice *dev, uchar *packet, int length)
 {
 	struct airoha_eth *eth = dev_get_priv(dev);
-	struct airoha_qdma *qdma = airoha_active_qdma(eth);
-	struct airoha_queue *q;
-	int qid;
+	int i;
 
 	if (!packet)
 		return 0;
 
-	if (eth->last_rx_valid && eth->last_rx_qdma < AIROHA_MAX_NUM_QDMA &&
-	    airoha_qdma_ready(&eth->qdma[eth->last_rx_qdma]))
-		qdma = &eth->qdma[eth->last_rx_qdma];
+	/*
+	 * Locate the queue that handed out this buffer.  Deriving the descriptor
+	 * index from the released pointer (instead of assuming "the last one")
+	 * is what makes a stale or repeated free visible as a generation
+	 * mismatch rather than as a corrupted RX ring.
+	 */
+	for (i = 0; i < AIROHA_MAX_NUM_QDMA; i++) {
+		struct airoha_qdma *qdma = &eth->qdma[i];
+		struct airoha_queue *q = &qdma->q_rx[0];
+		ulong offset;
 
-	qid = 0;
-	q = &qdma->q_rx[qid];
-	airoha_qdma_recycle_rx_desc(qdma, q, qid);
+		if (!airoha_qdma_ready(qdma) || !q->rx_buf || !q->ndesc)
+			continue;
+
+		if ((ulong)packet < (ulong)q->rx_buf)
+			continue;
+
+		offset = (ulong)packet - (ulong)q->rx_buf;
+		if (offset >= (ulong)q->ndesc * AIROHA_RX_BUF_SIZE)
+			continue;
+
+		if (offset % AIROHA_RX_BUF_SIZE)
+			continue;
+
+		airoha_rx_release_desc(q, offset / AIROHA_RX_BUF_SIZE);
+		airoha_rx_recycle_lines(qdma, q);
+		return 0;
+	}
+
+	eth->rx_free_unmatched++;
 
 	return 0;
 }

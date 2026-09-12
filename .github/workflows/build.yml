@@ -248,15 +248,33 @@ jobs:
 
           ## Flash via HTTP Recovery
 
-          1. Connect the PC to the device's **10GbE port** and enable DHCP.
+          1. Connect the PC to any **LAN** port (1G or 2.5G/10G; the WAN port is not served in auto mode) and leave the PC NIC in DHCP mode.
           2. Connect the device to power.
-          3. Wait for the front red LED to light up.
-          4. Within 5 seconds, use a pin to press and hold the recessed \`RESET\` button.
-          5. Keep holding until the front LEDs turn off and then light up again.
-          6. Release the \`RESET\` button when the LEDs begin cycling in an alternating rainbow breathing pattern.
-          7. Open [http://192.168.255.1](http://192.168.255.1/).
-          8. Select the **\`uboot\`** target.
-          9. Upload **\`${SLOT_NAME}\`** and wait for flashing to complete.
+          3. The status LED starts cycling through its colours. This is the recovery window (8 seconds by default).
+          4. Press the recessed \`RESET\` button once while the LED is cycling.
+          5. The status LED turns blue immediately when the button is pressed and then stays steady. The web server needs a few more seconds to come up.
+          6. Open [http://192.168.255.1](http://192.168.255.1/) (retry once if the page does not load yet).
+          7. Select the **\`uboot\`** target.
+          8. Upload **\`${SLOT_NAME}\`** and wait for flashing to complete.
+
+          If the window is missed the status LED flashes three times and the device continues to boot normally; power-cycle it and try again.
+
+          **Known limitation:** the 2.5G/10G port needs the RTL8261 link to train, which can take ~30 s in recovery and is not fully reliable. Use a **1G LAN port** when you need recovery to come up immediately.
+
+          ### 中文步骤（同一流程）
+
+          1. 电脑接任意 **LAN** 口（1G 或 2.5G/10G；WAN 口在 auto 模式下不提供服务），网卡保持 DHCP。
+          2. 给设备上电。
+          3. 状态灯开始按颜色循环闪烁，这就是恢复窗口（默认 8 秒）。
+          4. 在灯循环期间按一次 recessed \`RESET\` 键。
+          5. 按下按键的瞬间状态灯就变成蓝色，之后维持常亮；网页服务还需要几秒才能起来。
+          6. 浏览器打开 [http://192.168.255.1](http://192.168.255.1/)（若打不开，等几秒再刷新）。
+          7. 选择 **\`uboot\`** 目标。
+          8. 上传 **\`${SLOT_NAME}\`** 并等待烧写完成。
+
+          如果错过了窗口，状态灯会快速闪 3 次然后正常启动；重新上电再试即可。
+
+          **已知限制**：2.5G/10G 口需要等 RTL8261 链路训练，恢复模式下可能要 30 秒左右且不完全可靠；需要立刻可用时请插 **1G 口**。
 
           > **Important: Do not power off, disconnect, or reboot the device during recovery!**
 

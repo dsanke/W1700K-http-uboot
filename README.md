@@ -49,6 +49,108 @@ Added `.github/workflows/build.yml` for on-demand compilation and release publis
 
 Added `mock_server.py` for previewing and debugging the HTTP recovery UI locally without hardware.
 
+### 4. Recovery Entry Window with LED Cue
+
+**Problem**: recovery could only be entered by holding `reset` while the
+chainloader started. Nothing told the user when to press the button, and
+`board_late_init()` sampled the button only once before the (slow) NAND/UBI
+work, so the usable window was a few hundred milliseconds wide.
+
+**Design**: the chainloader now opens a visible recovery window before any
+NAND/UBI work:
+
+1. The status LEDs chase through their colour channels - one channel lit at a
+   time, 200 ms per step (W1700K RGBW status LED: red → green → blue → white).
+2. The reset button is polled every 20 ms for the whole window (default
+   8000 ms, see `recovery_window_ms` below).
+3. Pressing it once starts the web recovery immediately, and the status LED
+   turns blue at that very moment - before the web server is reachable.
+   While recovery is idle it stays a steady blue, and it switches to the
+   colour sweep while an image is being erased or written.
+4. No press → the LEDs flash three times ("window missed") and the normal
+   boot continues.
+
+**Tuning and fallbacks**
+
+- `recovery_window_ms` (U-Boot env): window length in ms, default `8000`.
+  Setting `0` disables the cue and restores the previous single-sample
+  behaviour.
+- `recovery_trigger` (one-shot, set by the LuCI recovery app) still enters
+  recovery directly, without the window.
+- Boards where no status LEDs can be claimed fall back to the legacy
+  single button sample.
+
+**Known limitation**: the 2.5G/10G port needs the RTL8261/USXGMII link to train,
+which can take ~30 s in recovery and is not fully reliable (the RTL8261 needs a
+full re-init that U-Boot only partially performs). Use a **1G LAN port** for a
+recovery session that comes up immediately; the 1G ports only depend on the
+internal switch.
+
+**Implementation**: `xr1710g_recovery_button_window()` in
+`board/airoha/an7581/an7581_rfb.c`; LED helpers
+`recovery_status_leds_cue_begin()/poll()/end()` in `net/lwip/httpd_recovery.c`.
+
+### 5. Auto-mode Recovery TX Egress Fallback
+
+**Problem**: with `recovery_port` unset (`auto` / dual-service) the recovery
+always used the internal 1G switch port (fport 1) as the default TX egress,
+even when no 1G port had link. On the W1700K a client attached to the 2.5G LAN
+port (GDM4, fport 4) therefore received nothing - RX worked (DHCP DISCOVER was
+even answered), but every unicast reply (ARP, HTTP) was transmitted into the
+idle switch port, so the recovery page stayed unreachable.
+
+**Fix**: in `airoha_pick_tx_fport()`, when dual-service is enabled and no 1G
+port has link, fall back to the external 10G/2.5G port when it is a candidate.
+The dedicated 1G ports keep priority whenever they have link, so the original
+behaviour is unchanged for XR1710G-style 1G-first setups.
+
+## 中文说明（Fork Changes 中文对照）
+
+### 4. 恢复入口窗口与 LED 提示
+
+**问题**：以前只能"启动时按住 reset"进恢复模式，没有任何视觉提示，用户不知道
+什么时候按、有没有按上；而且 `board_late_init()` 只在耗时的 NAND/UBI 操作之前
+采样一次按键，真正可用的窗口只有几百毫秒。
+
+**设计**：chainloader 在做任何 NAND/UBI 操作之前先开一个看得见的恢复窗口：
+
+1. 状态灯按颜色通道依次跑马灯，每 200 ms 换一个通道（W1700K 是 RGBW 状态灯：
+   红 → 绿 → 蓝 → 白）。
+2. 整个窗口内每 20 ms 采样一次 reset 键（窗口默认 8000 ms，可用
+   `recovery_window_ms` 调整，单位毫秒、十进制）。
+3. 窗口内按一下 reset 就立刻进入网页恢复，**按下瞬间状态灯就变蓝**（此时网页
+   服务还没起来）；空闲时维持常亮蓝，擦写阶段切回扫动进度动画。
+4. 窗口内没按 → 状态灯快速闪 3 次（提示"错过了窗口"），然后继续正常启动。
+
+操作方式：上电 → 看到状态灯开始 RGB 跑马灯 → 按一次 `reset` → 灯变成常亮蓝
+＝ 已进入恢复模式，浏览器打开 `http://192.168.255.1/`。
+
+**其他入口与回退**
+
+- `recovery_trigger`（一次性变量，由 LuCI 恢复插件写入）仍然可以直接进入恢复，
+  不走这个窗口。
+- 采不到状态灯的板子自动回退到原来的"单次采样"行为。
+
+**已知限制**：2.5G/10G 口需要等 RTL8261/USXGMII 链路训练，恢复模式下可能要 30
+秒左右，而且并不完全可靠（RTL8261 需要一次完整重新初始化，U-Boot 只做了其中一部分）。
+要求"秒进"的恢复场景请优先插 **1G 口**，它只依赖内部交换机，即插即用。
+
+**实现位置**：`xr1710g_recovery_button_window()`
+（`board/airoha/an7581/an7581_rfb.c`）、LED 辅助函数
+`recovery_status_leds_cue_begin()/poll()/end()`（`net/lwip/httpd_recovery.c`）。
+
+### 5. auto 模式恢复发送出口回退
+
+**问题**：`recovery_port` 未设置（auto / dual-service）时，恢复模式总是把内部
+1G 交换机口（fport 1）当作默认发送出口，哪怕 1G 口根本没有链路。W1700K 上如果
+客户端接在 2.5G LAN 口（GDM4，fport 4），收包是正常的（DHCP DISCOVER 都能收到
+并回应），但所有单播回应（ARP、HTTP）都被发进空闲的交换机口，恢复页面因此
+始终打不开。
+
+**修复**：在 `airoha_pick_tx_fport()` 中，dual-service 且 1G 口无链路时，回退到
+外部 10G/2.5G 口（前提是它被判定为候选）。1G 口有链路时仍然优先，所以
+XR1710G 那种"1G 优先"的行为保持不变。
+
 ---
 
 ## Original README

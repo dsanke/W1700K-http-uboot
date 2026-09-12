@@ -16,6 +16,7 @@
 #include <ubi_uboot.h>
 #include <an7581_recovery_version.h>
 #include <linux/bitops.h>
+#include <linux/delay.h>
 #include <linux/err.h>
 #include <linux/kconfig.h>
 #include <linux/string.h>
@@ -629,6 +630,11 @@ int board_init(void)
 }
 
 int run_http_recovery(void);
+int recovery_status_leds_cue_begin(void);
+void recovery_status_leds_cue_poll(void);
+void recovery_status_leds_cue_end(void);
+void recovery_status_leds_cue_all(bool on);
+void recovery_status_leds_cue_blue(void);
 
 static int xr1710g_recovery_button_pressed(void)
 {
@@ -650,6 +656,71 @@ static int xr1710g_recovery_button_pressed(void)
 	dm_gpio_free(NULL, &rec_gpio);
 
 	return ret > 0;
+}
+
+/*
+ * Give the user a visible window to request recovery: chase the status LEDs
+ * through their colours while polling the reset button. Returns true when the
+ * button was pressed (or when a LED-less board keeps the legacy behaviour of
+ * sampling it once).
+ *
+ * The window length is tunable with recovery_window_ms; 0 disables the cue and
+ * falls back to the plain single sample.
+ */
+static bool xr1710g_recovery_button_window(void)
+{
+	const char *window_env = env_get("recovery_window_ms");
+	ulong window_ms = window_env && *window_env ?
+			  simple_strtoul(window_env, NULL, 10) : 8000;
+	ulong start;
+	ulong debug_last = 0;
+
+	if (!window_ms || recovery_status_leds_cue_begin()) {
+		if (xr1710g_recovery_button_pressed()) {
+			printf("Recovery button detected, starting web recovery...\n");
+			return true;
+		}
+		return false;
+	}
+
+	printf("Hold reset to enter recovery (LED colour chase, %lums)\n",
+	       window_ms);
+	start = get_timer(0);
+	while (get_timer(0) - start < window_ms) {
+		recovery_status_leds_cue_poll();
+		if (env_get("recovery_debug") &&
+		    get_timer(0) - start >= debug_last + 250) {
+			debug_last = get_timer(0) - start;
+			printf("cue: btn=%d data0=%08x data1=%08x\n",
+			       xr1710g_recovery_button_pressed(),
+			       (unsigned int)readl((void __iomem *)(XR1710G_GPIO_SYSCTL_BASE +
+								    XR1710G_REG_GPIO_DATA)),
+			       (unsigned int)readl((void __iomem *)(XR1710G_GPIO_SYSCTL_BASE +
+								    XR1710G_REG_GPIO_DATA1)));
+		}
+		if (xr1710g_recovery_button_pressed()) {
+			/* Acknowledge immediately: hold blue while recovery starts. */
+			recovery_status_leds_cue_blue();
+			printf("Recovery button detected, starting web recovery...\n");
+			return true;
+		}
+		mdelay(20);
+	}
+
+	/*
+	 * Window closed without a press: give an unmistakable "you missed it"
+	 * cue (three quick all-channel flashes) instead of silently dropping
+	 * the LEDs, then hand the board over to the normal boot.
+	 */
+	for (int i = 0; i < 3; i++) {
+		recovery_status_leds_cue_all(true);
+		mdelay(120);
+		recovery_status_leds_cue_all(false);
+		mdelay(120);
+	}
+
+	recovery_status_leds_cue_end();
+	return false;
 }
 
 int board_late_init(void)
@@ -684,9 +755,8 @@ int board_late_init(void)
 			printf("Warning: failed to save environment, recovery "
 			       "will be re-entered on the next boot\n");
 		recovery_pending = true;
-	} else if (xr1710g_recovery_button_pressed()) {
-		printf("Recovery button detected, starting web recovery...\n");
-		recovery_pending = true;
+	} else {
+		recovery_pending = xr1710g_recovery_button_window();
 	}
 
 	/*

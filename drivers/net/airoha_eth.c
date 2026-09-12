@@ -1809,14 +1809,21 @@ static bool airoha_rtl8261_host_update_enabled(void)
 {
 	const char *host_update = env_get("rtl8261_host_update");
 
+	/*
+	 * Enabled by default: re-applying the RTL8261 serdes configuration on
+	 * every GDM4 bring-up/retry is what makes the 10G/2.5G recovery link
+	 * train deterministically, including from a cold power cycle where the
+	 * PHY no longer holds the mode a previous Linux boot programmed.
+	 * Set rtl8261_host_update=0/off/disable to skip it.
+	 */
 	if (!host_update)
-		return false;
-
-	if (!strcmp(host_update, "1") || !strcmp(host_update, "on") ||
-	    !strcmp(host_update, "enable"))
 		return true;
 
-	return false;
+	if (!strcmp(host_update, "0") || !strcmp(host_update, "off") ||
+	    !strcmp(host_update, "disable"))
+		return false;
+
+	return true;
 }
 
 static int airoha_env_override_bool(const char *name, bool *value)
@@ -4506,8 +4513,21 @@ void airoha_recovery_poll_link(struct udevice *dev)
 {
 	struct airoha_eth *eth = dev_get_priv(dev);
 	ulong now = get_timer(0);
+	static ulong dbg_last_ms;
 	u16 speed;
 	bool copper_up, host_ready, link_changed;
+
+	if (env_get("recovery_debug") &&
+	    (!dbg_last_ms || now - dbg_last_ms >= 5000)) {
+		dbg_last_ms = now;
+		printf("airoha: dbg pcs=%d usx=%d rxsig=%d gdm4_up=%d spd=%u fport[def=%u tx=%u rx=%u]\n",
+		       !!airoha_gdm4_pcs_link_up(eth),
+		       !!airoha_usxgmii_link_up(eth),
+		       !!airoha_eth_gdm4_have_rx_signal(eth),
+		       eth->gdm4_link_up, eth->gdm4_link_speed,
+		       eth->default_tx_fport, eth->last_tx_fport,
+		       eth->last_rx_fport);
+	}
 
 	if (eth->recovery_link_poll_started &&
 	    now - eth->recovery_last_link_poll_ms <
@@ -4608,8 +4628,18 @@ static u8 airoha_pick_tx_fport(struct airoha_eth *eth)
 	 * XR1710G after the upstream DM/DT merge. In dual-service mode keep
 	 * 1G as the conservative default; replies to confirmed 10G peers still
 	 * use the learned SPORT cache and broadcast frames are mirrored.
+	 *
+	 * When no 1G port has link, fall back to the external 10G/2.5G port
+	 * instead: on W1700K a client attached to the 2.5G LAN port (GDM4)
+	 * never sees a reply that is transmitted into the idle switch port,
+	 * because unicast replies are not covered by the broadcast mirroring.
 	 */
 	if (dual_service) {
+		if (gdm4_candidate) {
+			airoha_gdm4_ensure_ready(eth);
+			airoha_recovery_set_default_fport(eth, 4);
+			return 4;
+		}
 		airoha_recovery_set_default_fport(eth, 1);
 		return 1;
 	}

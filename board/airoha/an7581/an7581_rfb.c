@@ -671,7 +671,7 @@ static bool xr1710g_recovery_button_window(void)
 {
 	const char *window_env = env_get("recovery_window_ms");
 	ulong window_ms = window_env && *window_env ?
-			  simple_strtoul(window_env, NULL, 10) : 8000;
+			  simple_strtoul(window_env, NULL, 10) : 3000;
 	ulong start;
 	ulong debug_last = 0;
 
